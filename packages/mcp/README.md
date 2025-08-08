@@ -380,6 +380,63 @@ Prompt notifications are delivered via SSE or compatible transports. Register ha
 
 ## Authentication
 
+### Simple Authentication Options
+
+The MCP client now supports simplified authentication options for common use cases:
+
+#### Bearer Token Authentication
+
+For services that use bearer token authentication:
+
+```typescript
+const httpClient = new MCPClient({
+  servers: {
+    myAuthenticatedServer: {
+      url: new URL('https://your-mcp-server.com/mcp'),
+      bearerToken: 'your-bearer-token', // Automatically adds Authorization: Bearer header
+    },
+  },
+});
+```
+
+#### Custom Authentication Headers
+
+For services that require custom authentication headers:
+
+```typescript
+const httpClient = new MCPClient({
+  servers: {
+    myAuthenticatedServer: {
+      url: new URL('https://your-mcp-server.com/mcp'),
+      authHeaders: {
+        'X-API-Key': 'your-api-key',
+        'X-Client-Id': 'your-client-id',
+      },
+    },
+  },
+});
+```
+
+#### Combining Bearer Token and Custom Headers
+
+You can use both options together:
+
+```typescript
+const httpClient = new MCPClient({
+  servers: {
+    myAuthenticatedServer: {
+      url: new URL('https://your-mcp-server.com/mcp'),
+      bearerToken: 'your-bearer-token',
+      authHeaders: {
+        'X-Tenant-Id': 'tenant-123',
+      },
+    },
+  },
+});
+```
+
+These simplified authentication options automatically configure the appropriate headers for both Streamable HTTP and SSE transports, eliminating the need for complex `eventSourceInit` configuration.
+
 ### OAuth Token Refresh with AuthProvider
 
 For HTTP-based MCP servers that require OAuth authentication with automatic token refresh, you can use the `authProvider` option:
@@ -410,7 +467,7 @@ const httpClient = new MCPClient({
 });
 ```
 
-The `authProvider` is automatically passed to both Streamable HTTP and SSE transports.
+The `authProvider` is automatically passed to both Streamable HTTP and SSE transports. The client will automatically retry connections with refreshed tokens when it detects 401 authentication errors.
 
 ### SSE Authentication and Headers (Legacy Fallback)
 

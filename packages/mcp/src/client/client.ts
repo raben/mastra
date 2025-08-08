@@ -93,6 +93,10 @@ type HttpServerDefinition = BaseServerOptions & {
   authProvider?: StreamableHTTPClientTransportOptions['authProvider'];
   reconnectionOptions?: StreamableHTTPClientTransportOptions['reconnectionOptions'];
   sessionId?: StreamableHTTPClientTransportOptions['sessionId'];
+  
+  // Simplified authentication options
+  authHeaders?: Record<string, string>; // Simple header-based auth
+  bearerToken?: string; // Bearer token authentication
 };
 
 export type MastraMCPServerDefinition = StdioServerDefinition | HttpServerDefinition;
@@ -237,29 +241,101 @@ export class InternalMastraMCPClient extends MastraBase {
     }
   }
 
+  private isAuthError(error: unknown): boolean {
+    // Check if error contains 401 status or unauthorized message
+    if (error instanceof Error) {
+      const message = error.message.toLowerCase();
+      return message.includes('401') || message.includes('unauthorized') || message.includes('authentication');
+    }
+    return false;
+  }
+
+  private async connectWithRetry(transportFactory: () => Promise<Transport>, retryOnAuth: boolean = true): Promise<Transport> {
+    try {
+      return await transportFactory();
+    } catch (error) {
+      if (retryOnAuth && this.isAuthError(error) && this.serverConfig.authProvider) {
+        this.log('debug', 'Authentication failed, attempting to refresh token...');
+        // The authProvider should handle token refresh internally
+        // Retry once after auth failure
+        try {
+          return await transportFactory();
+        } catch (retryError) {
+          this.log('error', 'Failed to connect after token refresh');
+          throw retryError;
+        }
+      }
+      throw error;
+    }
+  }
+
   private async connectHttp(url: URL) {
-    const { requestInit, eventSourceInit, authProvider } = this.serverConfig;
+    const { requestInit, eventSourceInit, authProvider, authHeaders, bearerToken } = this.serverConfig;
 
     this.log('debug', `Attempting to connect to URL: ${url}`);
+
+    // Build authentication configuration from simplified options if provided
+    let finalRequestInit = requestInit;
+    let finalEventSourceInit = eventSourceInit;
+    let finalAuthProvider = authProvider;
+
+    // Handle simplified authentication options
+    if (authHeaders || bearerToken) {
+      // Prepare headers for authentication
+      const headers: Record<string, string> = {};
+      
+      if (bearerToken) {
+        headers['Authorization'] = `Bearer ${bearerToken}`;
+      }
+      
+      if (authHeaders) {
+        Object.assign(headers, authHeaders);
+      }
+
+      // Merge headers into requestInit for Streamable HTTP transport
+      finalRequestInit = {
+        ...requestInit,
+        headers: {
+          ...(requestInit?.headers || {}),
+          ...headers,
+        },
+      };
+
+      // Create eventSourceInit with custom fetch if not already provided
+      if (!eventSourceInit) {
+        finalEventSourceInit = {
+          fetch: (input: Request | URL | string, init?: RequestInit) => {
+            const mergedHeaders = new Headers(init?.headers || {});
+            Object.entries(headers).forEach(([key, value]) => {
+              mergedHeaders.set(key, value);
+            });
+            return fetch(input, { ...init, headers: mergedHeaders });
+          },
+        };
+      }
+    }
 
     // Assume /sse means sse.
     let shouldTrySSE = url.pathname.endsWith(`/sse`);
 
     if (!shouldTrySSE) {
       try {
-        // Try Streamable HTTP transport first
+        // Try Streamable HTTP transport first with retry logic
         this.log('debug', 'Trying Streamable HTTP transport...');
-        const streamableTransport = new StreamableHTTPClientTransport(url, {
-          requestInit,
-          reconnectionOptions: this.serverConfig.reconnectionOptions,
-          authProvider: authProvider,
+        
+        await this.connectWithRetry(async () => {
+          const streamableTransport = new StreamableHTTPClientTransport(url, {
+            requestInit: finalRequestInit,
+            reconnectionOptions: this.serverConfig.reconnectionOptions,
+            authProvider: finalAuthProvider,
+          });
+          await this.client.connect(streamableTransport, {
+            timeout: 3000, // hardcoded to 3s for fast SSE fallback
+          });
+          this.transport = streamableTransport;
+          return streamableTransport;
         });
-        await this.client.connect(streamableTransport, {
-          timeout:
-            // this is hardcoded to 3s because the long default timeout would be extremely slow for sse backwards compat (60s)
-            3000,
-        });
-        this.transport = streamableTransport;
+        
         this.log('debug', 'Successfully connected using Streamable HTTP transport.');
       } catch (error) {
         this.log('debug', `Streamable HTTP transport failed: ${error}`);
@@ -270,10 +346,18 @@ export class InternalMastraMCPClient extends MastraBase {
     if (shouldTrySSE) {
       this.log('debug', 'Falling back to deprecated HTTP+SSE transport...');
       try {
-        // Fallback to SSE transport
-        const sseTransport = new SSEClientTransport(url, { requestInit, eventSourceInit, authProvider });
-        await this.client.connect(sseTransport, { timeout: this.serverConfig.timeout ?? this.timeout });
-        this.transport = sseTransport;
+        // Fallback to SSE transport with retry logic
+        await this.connectWithRetry(async () => {
+          const sseTransport = new SSEClientTransport(url, { 
+            requestInit: finalRequestInit, 
+            eventSourceInit: finalEventSourceInit, 
+            authProvider: finalAuthProvider 
+          });
+          await this.client.connect(sseTransport, { timeout: this.serverConfig.timeout ?? this.timeout });
+          this.transport = sseTransport;
+          return sseTransport;
+        });
+        
         this.log('debug', 'Successfully connected using deprecated HTTP+SSE transport.');
       } catch (sseError) {
         this.log(

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
-import type { Server as HttpServer } from 'node:http';
+import type { Server as HttpServer, IncomingMessage, ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -580,6 +580,162 @@ describe('MastraMCPClient - AuthProvider Tests', () => {
     await client.connect();
     const tools = await client.tools();
     expect(tools).toHaveProperty('greet');
+  });
+});
+
+describe('MastraMCPClient - Authentication Tests', () => {
+  let testServer: {
+    httpServer: HttpServer;
+    mcpServer: McpServer;
+    serverTransport: StreamableHTTPServerTransport;
+    baseUrl: URL;
+  };
+  let authServer: HttpServer;
+  let authServerUrl: URL;
+  let client: InternalMastraMCPClient;
+
+  beforeEach(async () => {
+    // Setup test server
+    testServer = await setupTestServer(false);
+
+    // Setup authentication test server
+    authServer = createServer((req: IncomingMessage, res: ServerResponse) => {
+      // Check for authentication headers
+      const authHeader = req.headers['authorization'];
+      const apiKey = req.headers['x-api-key'];
+      
+      if (authHeader === 'Bearer test-token' || apiKey === 'test-api-key') {
+        // Forward to MCP server if authenticated
+        testServer.serverTransport.handleRequest(req, res);
+      } else {
+        // Return 401 if not authenticated
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+      }
+    });
+
+    authServerUrl = await new Promise<URL>(resolve => {
+      authServer.listen(0, '127.0.0.1', () => {
+        const addr = authServer.address() as AddressInfo;
+        resolve(new URL(`http://127.0.0.1:${addr.port}/mcp`));
+      });
+    });
+  });
+
+  afterEach(async () => {
+    await client?.disconnect();
+    await new Promise<void>(resolve => authServer.close(() => resolve()));
+    await new Promise<void>(resolve => testServer.httpServer.close(() => resolve()));
+  });
+
+  it('should authenticate with bearer token', async () => {
+    client = new InternalMastraMCPClient({
+      name: 'bearer-auth-client',
+      server: {
+        url: authServerUrl,
+        bearerToken: 'test-token',
+      },
+    });
+
+    await client.connect();
+    const tools = await client.tools();
+    expect(tools).toHaveProperty('greet');
+    
+    // Test that the tool works
+    const result = await tools.greet.execute({ context: { name: 'Authenticated' } });
+    expect(result).toEqual({ content: [{ type: 'text', text: 'Hello, Authenticated!' }] });
+  });
+
+  it('should authenticate with custom headers', async () => {
+    client = new InternalMastraMCPClient({
+      name: 'custom-auth-client',
+      server: {
+        url: authServerUrl,
+        authHeaders: {
+          'X-API-Key': 'test-api-key',
+        },
+      },
+    });
+
+    await client.connect();
+    const tools = await client.tools();
+    expect(tools).toHaveProperty('greet');
+  });
+
+  it('should authenticate with both bearer token and custom headers', async () => {
+    client = new InternalMastraMCPClient({
+      name: 'combined-auth-client',
+      server: {
+        url: authServerUrl,
+        bearerToken: 'test-token',
+        authHeaders: {
+          'X-Client-Id': 'client-123',
+        },
+      },
+    });
+
+    await client.connect();
+    const tools = await client.tools();
+    expect(tools).toHaveProperty('greet');
+  });
+
+  it('should fail to connect without proper authentication', async () => {
+    client = new InternalMastraMCPClient({
+      name: 'unauthenticated-client',
+      server: {
+        url: authServerUrl,
+        // No authentication provided
+      },
+    });
+
+    await expect(client.connect()).rejects.toThrow('Could not connect to server');
+  });
+
+  it('should retry with refreshed token on 401 error', async () => {
+    let tokenCallCount = 0;
+    const tokens = ['expired-token', 'valid-token'];
+    
+    // Create a server that accepts only the second token
+    const retryAuthServer = createServer((req: IncomingMessage, res: ServerResponse) => {
+      const authHeader = req.headers['authorization'];
+      
+      if (authHeader === 'Bearer valid-token') {
+        testServer.serverTransport.handleRequest(req, res);
+      } else {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+      }
+    });
+
+    const retryAuthServerUrl = await new Promise<URL>(resolve => {
+      retryAuthServer.listen(0, '127.0.0.1', () => {
+        const addr = retryAuthServer.address() as AddressInfo;
+        resolve(new URL(`http://127.0.0.1:${addr.port}/mcp`));
+      });
+    });
+
+    client = new InternalMastraMCPClient({
+      name: 'retry-auth-client',
+      server: {
+        url: retryAuthServerUrl,
+        authProvider: {
+          tokens: async () => {
+            const token = tokens[tokenCallCount++];
+            return {
+              token,
+              type: 'Bearer',
+            };
+          },
+        },
+      },
+    });
+
+    await client.connect();
+    const tools = await client.tools();
+    expect(tools).toHaveProperty('greet');
+    expect(tokenCallCount).toBe(2); // Should have been called twice
+
+    await new Promise<void>(resolve => retryAuthServer.close(() => resolve()));
   });
 
 });
